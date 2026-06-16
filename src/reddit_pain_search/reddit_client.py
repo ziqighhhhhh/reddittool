@@ -17,6 +17,8 @@ class RedditClient:
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "RedditClient":
+        if not config.reddit_client_id or not config.reddit_client_secret or not config.reddit_user_agent:
+            raise ValueError("Reddit API credentials are required for the PRAW client")
         reddit = praw.Reddit(
             client_id=config.reddit_client_id,
             client_secret=config.reddit_client_secret.get_secret_value(),

@@ -9,8 +9,8 @@ from reddit_pain_search.classifier import KimiClassifier
 from reddit_pain_search.config import load_config
 from reddit_pain_search.exporter import export_csv
 from reddit_pain_search.models import validate_product_name
-from reddit_pain_search.reddit_client import RedditClient
 from reddit_pain_search.repository import Repository
+from reddit_pain_search.web_access_reddit_client import WebAccessRedditClient
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -40,7 +40,7 @@ def main(
             comments_per_post=comments_per_post,
         )
     except Exception as error:
-        typer.echo(f"Reddit API failed: {error}", err=True)
+        typer.echo(f"Reddit data fetch failed: {error}", err=True)
         raise typer.Exit(code=1) from error
 
     repository.save_content_items(items)
@@ -73,7 +73,7 @@ def _has_injected_dependencies(ctx: typer.Context) -> bool:
 def _get_reddit_client(ctx: typer.Context, config: Any) -> Any:
     if ctx.obj and "reddit_client" in ctx.obj:
         return ctx.obj["reddit_client"]
-    return RedditClient.from_config(config)
+    return WebAccessRedditClient.from_config(config)
 
 
 def _get_classifier(ctx: typer.Context, config: Any) -> Any:

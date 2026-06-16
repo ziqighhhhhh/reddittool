@@ -1,3 +1,6 @@
+import pytest
+
+from reddit_pain_search.config import AppConfig
 from reddit_pain_search.models import SourceType
 from reddit_pain_search.reddit_client import RedditClient
 
@@ -53,3 +56,10 @@ def test_search_product_returns_post_and_comment_items():
     assert items[0].score == 50
     assert items[1].reddit_id == "comment1"
     assert items[1].title == "Notion problem"
+
+
+def test_from_config_requires_reddit_api_credentials():
+    config = AppConfig(moonshot_api_key="moonshot")
+
+    with pytest.raises(ValueError, match="Reddit API credentials"):
+        RedditClient.from_config(config)

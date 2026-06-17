@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError
 
 from reddit_pain_search.config import AppConfig
 from reddit_pain_search.models import AnalysisStatus, ClassificationResult, ContentItem, PainCategory
 
 
-KIMI_BASE_URL = "https://api.moonshot.ai/v1"
 MAX_TEXT_CHARS = 3000
+API_RETRY_ATTEMPTS = 2
 
 
 class KimiResponse(BaseModel):
@@ -29,10 +29,10 @@ class KimiClassifier:
     @classmethod
     def from_config(cls, config: AppConfig) -> "KimiClassifier":
         client = OpenAI(
-            api_key=config.moonshot_api_key.get_secret_value(),
-            base_url=KIMI_BASE_URL,
+            api_key=config.llm_api_key.get_secret_value(),
+            base_url=config.llm_base_url,
         )
-        return cls(client=client, model=config.kimi_model)
+        return cls(client=client, model=config.llm_model)
 
     def classify(self, item: ContentItem) -> ClassificationResult:
         last_error = "Kimi response was not valid JSON"
@@ -48,22 +48,39 @@ class KimiClassifier:
                     analysis_status=AnalysisStatus.SUCCESS,
                     error_message=None,
                 )
+            except (APITimeoutError, APIConnectionError, RateLimitError, APIError):
+                raise
             except (json.JSONDecodeError, ValidationError, KeyError, TypeError, ValueError) as error:
                 last_error = f"Kimi response was not valid JSON: {error}"
         return ClassificationResult.failed(item.content_hash, last_error)
 
     def _request_classification(self, item: ContentItem) -> KimiResponse:
-        response = self._client.chat.completions.create(
-            model=self._model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _system_prompt()},
-                {"role": "user", "content": _user_prompt(item)},
-            ],
-        )
-        content = response.choices[0].message.content
-        payload = json.loads(content)
-        return KimiResponse.model_validate(payload)
+        last_api_error: Exception | None = None
+        for attempt in range(API_RETRY_ATTEMPTS + 1):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": _system_prompt()},
+                        {"role": "user", "content": _user_prompt(item)},
+                    ],
+                )
+            except APITimeoutError as error:
+                last_api_error = error
+                continue
+            except APIConnectionError as error:
+                last_api_error = error
+                continue
+            except RateLimitError as error:
+                last_api_error = error
+                continue
+            except APIError as error:
+                raise error
+            content = response.choices[0].message.content
+            payload = json.loads(content)
+            return KimiResponse.model_validate(payload)
+        raise last_api_error if last_api_error else RuntimeError("LLM API request failed")
 
 
 def _system_prompt() -> str:

@@ -1,0 +1,7 @@
+Starting analyze-only at 17/06/2026 Wed  1:42:41.39 
+Working directory: C:\Users\1\Downloads\redditÍ´µã¼ìË÷ 
+Running: python -m reddit_pain_search "_all_" --analyze-only 
+Classifying 1 uncached items across all products with up to 10 workers.
+Classified o88a4mt: pain_point=False, category=none
+Wrote 1929 rows to results\reddit-pain-search-CR2025\CR2450\CR123A.csv
+Finished with exit code 0 at 17/06/2026 Wed  1:43:13.95 

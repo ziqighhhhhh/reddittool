@@ -1,0 +1,7 @@
+﻿.\analyze-only.bat : 命令语法不正确。
+所在位置 行:1 字符: 39
++ cd "C:\Users\1\Downloads\reddit痛点检索"; .\analyze-only.bat 2>&1 | Out-F ...
++                                       ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (命令语法不正确。:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

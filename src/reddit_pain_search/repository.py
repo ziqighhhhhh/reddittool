@@ -75,6 +75,18 @@ class Repository:
             ).fetchall()
         return [_content_from_row(row) for row in rows]
 
+    def list_all_unanalyzed_content(self) -> list[ContentItem]:
+        with self._connect() as connection:
+            all_rows = connection.execute(
+                """
+                SELECT source_type, reddit_id, product_name, subreddit, title, text, score, url, created_utc
+                FROM content_items
+                ORDER BY product_name ASC, score DESC, reddit_id ASC
+                """
+            ).fetchall()
+        items = [_content_from_row(row) for row in all_rows]
+        return [item for item in items if self.get_analysis(item.content_hash) is None]
+
     def list_unanalyzed_content(self, product_name: str) -> list[ContentItem]:
         items = self.list_content_for_product(product_name)
         return [item for item in items if self.get_analysis(item.content_hash) is None]

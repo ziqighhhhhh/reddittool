@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib import error, parse, request
 
@@ -12,6 +13,11 @@ from reddit_pain_search.models import ContentItem, SourceType, validate_product_
 
 REDDIT_SEARCH_URL = "https://www.reddit.com/search/"
 COMMENT_PATH_RE = re.compile(r"/r/(?P<subreddit>[^/]+)/comments/(?P<reddit_id>[^/]+)", re.IGNORECASE)
+SCORE_TEXT_RE = re.compile(r"(?P<number>-?\d+(?:\.\d+)?)\s*(?P<suffix>[kKmM]?)")
+MAX_AUTO_SEARCH_SCROLLS = 60
+MIN_AUTO_SEARCH_SCROLLS = 3
+POSTS_PER_SEARCH_SCROLL_ESTIMATE = 5
+SEARCH_SCROLL_WAIT_SECONDS = 1.0
 
 
 class BrowserProxyError(RuntimeError):
@@ -63,12 +69,23 @@ class BrowserProxy:
 
 
 class WebAccessRedditClient:
-    def __init__(self, proxy: BrowserProxy) -> None:
+    def __init__(
+        self,
+        proxy: BrowserProxy,
+        progress: Callable[[str], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._proxy = proxy
+        self._progress = progress
+        self._sleep = sleep
 
     @classmethod
-    def from_config(cls, config: AppConfig) -> "WebAccessRedditClient":
-        return cls(BrowserProxy(config.web_access_proxy_url))
+    def from_config(
+        cls,
+        config: AppConfig,
+        progress: Callable[[str], None] | None = None,
+    ) -> "WebAccessRedditClient":
+        return cls(BrowserProxy(config.web_access_proxy_url), progress=progress)
 
     def search_product(
         self,
@@ -76,19 +93,63 @@ class WebAccessRedditClient:
         *,
         limit_posts: int,
         comments_per_post: int,
+        exclude_reddit_ids: set[str] | frozenset[str] = frozenset(),
+        max_search_scrolls: int | None = None,
     ) -> list[ContentItem]:
         product = validate_product_name(product_name)
         if limit_posts < 1:
             raise ValueError("limit_posts must be at least 1")
         if comments_per_post < 0:
             raise ValueError("comments_per_post must be 0 or greater")
+        if max_search_scrolls is not None and max_search_scrolls < 0:
+            raise ValueError("max_search_scrolls must be 0 or greater")
+        search_scrolls = max_search_scrolls if max_search_scrolls is not None else _estimate_search_scrolls(limit_posts)
 
+        self._report(f"Opening Reddit search for {product}...")
         search_target = self._proxy.open(_search_url(product))
         try:
-            post_links = _unique_post_links(self._proxy.eval_json(search_target, _search_extraction_script()))
-            return self._read_posts(product, post_links[:limit_posts], comments_per_post)
+            post_links = self._collect_search_post_links(
+                search_target,
+                limit_posts=limit_posts,
+                exclude_reddit_ids=exclude_reddit_ids,
+                max_search_scrolls=search_scrolls,
+            )
+            unread_links = [
+                link
+                for link in post_links
+                if link["reddit_id"] not in exclude_reddit_ids
+            ]
+            skipped_count = len(post_links) - len(unread_links)
+            self._report(
+                f"Found {len(post_links)} candidate posts; skipped {skipped_count} already fetched; "
+                f"reading up to {limit_posts} new posts."
+            )
+            return self._read_posts(product, unread_links[:limit_posts], comments_per_post)
         finally:
             self._proxy.close(search_target)
+
+    def _collect_search_post_links(
+        self,
+        search_target: str,
+        *,
+        limit_posts: int,
+        exclude_reddit_ids: set[str] | frozenset[str],
+        max_search_scrolls: int,
+    ) -> list[dict[str, str]]:
+        post_links: list[dict[str, str]] = []
+        for scroll_index in range(max_search_scrolls + 1):
+            post_links = _unique_post_links(self._proxy.eval_json(search_target, _search_extraction_script()))
+            unread_count = sum(1 for link in post_links if link["reddit_id"] not in exclude_reddit_ids)
+            if unread_count >= limit_posts or scroll_index == max_search_scrolls:
+                return post_links
+
+            self._report(
+                f"Loaded {len(post_links)} candidate posts ({unread_count} new); "
+                f"scrolling search page {scroll_index + 1}/{max_search_scrolls}..."
+            )
+            self._proxy.eval_json(search_target, _search_scroll_script())
+            self._sleep(SEARCH_SCROLL_WAIT_SECONDS)
+        return post_links
 
     def _read_posts(
         self,
@@ -97,7 +158,9 @@ class WebAccessRedditClient:
         comments_per_post: int,
     ) -> list[ContentItem]:
         items: list[ContentItem] = []
-        for link in post_links:
+        total = len(post_links)
+        for index, link in enumerate(post_links, start=1):
+            self._report(f"Reading post {index}/{total}: {link['url']}")
             target_id = self._proxy.open(link["url"])
             try:
                 post_payload = self._proxy.eval_json(target_id, _post_extraction_script(comments_per_post))
@@ -106,10 +169,19 @@ class WebAccessRedditClient:
                 self._proxy.close(target_id)
         return items
 
+    def _report(self, message: str) -> None:
+        if self._progress:
+            self._progress(message)
+
 
 def _search_url(product: str) -> str:
     query = parse.urlencode({"q": product, "type": "link", "sort": "relevance"})
     return f"{REDDIT_SEARCH_URL}?{query}"
+
+
+def _estimate_search_scrolls(limit_posts: int) -> int:
+    estimated = (limit_posts + POSTS_PER_SEARCH_SCROLL_ESTIMATE - 1) // POSTS_PER_SEARCH_SCROLL_ESTIMATE
+    return min(MAX_AUTO_SEARCH_SCROLLS, max(MIN_AUTO_SEARCH_SCROLLS, estimated))
 
 
 def _unique_post_links(rows: Any) -> list[dict[str, str]]:
@@ -128,7 +200,11 @@ def _unique_post_links(rows: Any) -> list[dict[str, str]]:
         if normalized in seen:
             continue
         seen.add(normalized)
-        links.append({"url": normalized, "title": str(row.get("title", "")).strip()})
+        links.append({
+            "reddit_id": match.group("reddit_id"),
+            "url": normalized,
+            "title": str(row.get("title", "")).strip(),
+        })
     return links
 
 
@@ -148,7 +224,7 @@ def _payload_to_items(product: str, payload: Any, comments_per_post: int) -> lis
         subreddit=subreddit,
         title=title,
         text=_string_or_default(payload.get("text"), ""),
-        score=_int_or_default(payload.get("score"), 0),
+        score=_score_or_default(payload.get("score"), 0),
         url=_normalize_reddit_url(str(payload.get("url", ""))),
         created_utc=_float_or_default(payload.get("created_utc"), time.time()),
     )
@@ -161,7 +237,7 @@ def _payload_to_items(product: str, payload: Any, comments_per_post: int) -> lis
             subreddit=subreddit,
             title=title,
             text=text,
-            score=_int_or_default(comment.get("score"), 0),
+            score=_score_or_default(comment.get("score"), 0),
             url=_normalize_reddit_url(_string_or_default(comment.get("url"), post.url)),
             created_utc=_float_or_default(comment.get("created_utc"), post.created_utc),
         )
@@ -196,6 +272,25 @@ def _int_or_default(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _score_or_default(value: Any, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if value is None:
+        return default
+
+    text = str(value).strip().replace(",", "")
+    match = SCORE_TEXT_RE.search(text)
+    if not match:
+        return default
+
+    number = float(match.group("number"))
+    suffix = match.group("suffix").casefold()
+    multiplier = {"k": 1_000, "m": 1_000_000}.get(suffix, 1)
+    return int(number * multiplier)
 
 
 def _float_or_default(value: Any, default: float) -> float:
@@ -249,9 +344,73 @@ def _search_extraction_script() -> str:
 """
 
 
+def _search_scroll_script() -> str:
+    return r"""
+(() => {
+  const beforeHeight = document.documentElement.scrollHeight || document.body.scrollHeight || 0;
+  window.scrollTo(0, beforeHeight);
+  return JSON.stringify({
+    beforeHeight,
+    scrollY: window.scrollY,
+    viewportHeight: window.innerHeight,
+  });
+})()
+"""
+
+
 def _post_extraction_script(comments_per_post: int) -> str:
     return rf"""
 (() => {{
+  const parseScore = (value) => {{
+    if (value === null || value === undefined) return 0;
+    const text = String(value).replace(/,/g, '').trim();
+    const match = text.match(/-?\d+(?:\.\d+)?\s*[kKmM]?/);
+    if (!match) return 0;
+    const raw = match[0].trim();
+    const number = Number.parseFloat(raw);
+    if (!Number.isFinite(number)) return 0;
+    const suffix = raw.slice(-1).toLowerCase();
+    if (suffix === 'k') return Math.trunc(number * 1000);
+    if (suffix === 'm') return Math.trunc(number * 1000000);
+    return Math.trunc(number);
+  }};
+  const scoreFromElement = (element) => {{
+    if (!element) return 0;
+    const attributes = ['score', 'upvotes', 'data-score', 'aria-label', 'title'];
+    for (const attribute of attributes) {{
+      const score = parseScore(element.getAttribute?.(attribute));
+      if (score) return score;
+    }}
+    return parseScore(element.innerText || element.textContent || '');
+  }};
+  const extractPostScore = () => {{
+    const post = document.querySelector('shreddit-post');
+    const selectors = [
+      '[data-testid="post-vote-arrows"]',
+      '[slot="vote-arrows"]',
+      'faceplate-number',
+      'span[aria-label*="upvote" i]',
+      'span[aria-label*="point" i]',
+    ];
+    for (const candidate of [post, ...selectors.map((selector) => document.querySelector(selector))]) {{
+      const score = scoreFromElement(candidate);
+      if (score) return score;
+    }}
+    return 0;
+  }};
+  const extractCommentScore = (commentNode) => {{
+    const selectors = [
+      '[slot="vote-arrows"]',
+      'faceplate-number',
+      'span[aria-label*="upvote" i]',
+      'span[aria-label*="point" i]',
+    ];
+    for (const candidate of [commentNode, ...selectors.map((selector) => commentNode.querySelector?.(selector))]) {{
+      const score = scoreFromElement(candidate);
+      if (score) return score;
+    }}
+    return 0;
+  }};
   const pathMatch = location.pathname.match(/\/r\/([^/]+)\/comments\/([^/]+)/i) || [];
   const title =
     document.querySelector('h1')?.innerText?.trim() ||
@@ -272,7 +431,7 @@ def _post_extraction_script(comments_per_post: int) -> str:
     return {{
       reddit_id: String(id).replace(/^t1_/, ''),
       text,
-      score: 0,
+      score: extractCommentScore(node),
       url: permalink,
       created_utc: Date.now() / 1000,
     }};
@@ -282,7 +441,7 @@ def _post_extraction_script(comments_per_post: int) -> str:
     subreddit: pathMatch[1] || 'unknown',
     title,
     text: body,
-    score: 0,
+    score: extractPostScore(),
     url: location.href,
     created_utc: Date.now() / 1000,
     comments,

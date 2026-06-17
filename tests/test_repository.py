@@ -57,6 +57,29 @@ def test_repository_finds_unanalyzed_items(tmp_path):
     assert unanalyzed == [second]
 
 
+def test_repository_finds_all_unanalyzed_items(tmp_path):
+    repo = Repository(tmp_path / "test.sqlite3")
+    notion_analyzed = make_content("abc", text="Hard to use")
+    notion_unanalyzed = make_content("def", text="Easy to use")
+    figma_unanalyzed = ContentItem(
+        source_type=SourceType.POST,
+        reddit_id="figma1",
+        product_name="Figma",
+        subreddit="design",
+        title="Figma issue",
+        text="Figma is slow",
+        score=5,
+        url="https://reddit.com/figma1",
+        created_utc=1_700_000_000.0,
+    )
+    repo.save_content_items([notion_analyzed, notion_unanalyzed, figma_unanalyzed])
+    repo.save_analysis(make_analysis(notion_analyzed.content_hash))
+
+    unanalyzed = repo.list_all_unanalyzed_content()
+
+    assert unanalyzed == [figma_unanalyzed, notion_unanalyzed]
+
+
 def test_repository_builds_report_rows_sorted(tmp_path):
     repo = Repository(tmp_path / "test.sqlite3")
     low_pain = make_content("low", score=1, text="Hard to use")

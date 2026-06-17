@@ -59,7 +59,7 @@ def test_search_product_returns_post_and_comment_items():
 
 
 def test_from_config_requires_reddit_api_credentials():
-    config = AppConfig(moonshot_api_key="moonshot")
+    config = AppConfig(llm_api_key="dashscope")
 
     with pytest.raises(ValueError, match="Reddit API credentials"):
         RedditClient.from_config(config)
